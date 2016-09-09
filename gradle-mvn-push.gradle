@@ -1,0 +1,365 @@
+/*
+ * Copyright 2013 Chris Banes
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Modified 2016 Ulrik Bech Hald
+ *  - Add javadoc excludes certain paths
+ *  - Add bintray support
+ *  - Option to exclude sources
+ */
+
+/**
+ * This plugin script adds tasks to help publish the module artifact to a Maven repository.
+ *
+ * The idea is that this script is applied to all subprojects from the root project build.gradle:
+ *
+ *  subprojects {
+ *      // Publishing to maven (mavenLocal (via install), remote maven (via uploadArchives) and Bintray (via bintrayUpload))
+ *      apply from: rootProject.file('gradle-mvn-push.gradle')
+ *  }
+ *
+ * In order to do so, you will need to add the following buildscript dependency to the root project build.gradle:
+ *
+ *  buildscript {
+ *      repositories {
+ *          jcenter()
+ *      }
+ *      dependencies {
+ *          classpath 'com.jfrog.bintray.gradle:gradle-bintray-plugin:1.7.1' // required by 'gradle-mvn-push.gradle'
+ *      }
+ *  }
+ *
+ *  The artifact version is picked up as the project.version gradle property.
+ *
+ * Supported repos are
+ *  - Local maven repository (.m2 folder on your build host)
+ *  - Remote maven repository and snapshot repository
+ *  - Bintray repository (note that Bintray does not support SNAPSHOT versions)
+ *
+ * USAGE:
+ *
+ * Local Maven Repo
+ * Use the 'install' task
+ *
+ * Remote Maven Repo
+ * Use the uploadArchives task
+ *
+ * Bintray
+ * Use the bintrayUpload task
+ */
+
+apply plugin: 'maven'
+apply plugin: 'signing'
+apply plugin: 'com.jfrog.bintray'
+
+group = GROUP
+
+/**
+ * True if the artifact to publish is an android artifact (apk or aar)
+ */
+def isAndroidArtifact() {
+    return (project.getPlugins().hasPlugin('com.android.application') ||
+            project.getPlugins().hasPlugin('com.android.library'))
+}
+
+/**
+ * True if build version is not marked as being a SNAPSHOT (as per maven versioning semantics)
+ */
+def isReleaseBuild() {
+    return version.contains("SNAPSHOT") == false
+}
+
+def getReleaseRepositoryUrl() {
+    return findProperty('RELEASE_REPOSITORY_URL') ?: "https://oss.sonatype.org/service/local/staging/deploy/maven2/"
+}
+
+def getSnapshotRepositoryUrl() {
+    return findProperty('SNAPSHOT_REPOSITORY_URL') ?: "https://oss.sonatype.org/content/repositories/snapshots/"
+}
+
+/**
+ * The username for the remote maven repository
+ */
+def getRepositoryUsername() {
+    return findProperty('mavenRepoUser') ?: 'defaultMavenRepoUser'
+}
+
+/**
+ * The password for the remote maven repository
+ */
+def getRepositoryPassword() {
+    return findProperty('mavenRepoPassword') ?: 'defaultMavenRepoPassword'
+}
+
+/**
+ * The username for the remote maven repository
+ */
+def getBintrayUsername() {
+    return findProperty('bintrayUser') ?: 'defaultBintrayUser'
+}
+
+/**
+ * The password for the remote maven repository
+ */
+def getBintrayKey() {
+    return findProperty('bintrayKey') ?: 'defaultBintrayKey'
+}
+
+/**
+ * Returns the defined license as an array or null if the property doesn't exist or is an empty string
+ */
+def getBintrayLicenses() {
+    def exists = hasProperty('POM_LICENSE_NAME') && !property('POM_LICENSE_NAME').isEmpty()
+
+    if (exists) {
+        return property('POM_LICENSE_NAME')
+    }
+    return null;
+}
+
+/**
+ * The paths to exclude when generating javadocs. The path pattern follows the syntax define in
+ * https://docs.gradle.org/current/dsl/org.gradle.api.tasks.javadoc.Javadoc.html#org.gradle.api.tasks.javadoc.Javadoc:excludes
+ */
+def getJavadocExcludes() {
+    return findProperty('JAVADOC_EXCLUDE_PATH') ?: ""
+}
+
+/**
+ * True if sources should not be published along with the artifact
+ */
+def excludeSources() {
+    return hasProperty('EXCLUDE_SOURCES') ? EXCLUDE_SOURCES.toBoolean() : false
+}
+
+configurations { deployerJars }
+
+dependencies {
+    deployerJars "org.apache.maven.wagon:wagon-ssh:2.9"
+}
+
+afterEvaluate { project ->
+    uploadArchives {
+        repositories {
+            mavenDeployer {
+                beforeDeployment { MavenDeployment deployment -> signing.signPom(deployment) }
+
+                configuration = configurations.deployerJars
+
+                pom.groupId = GROUP
+                pom.artifactId = POM_ARTIFACT_ID
+                pom.version = version
+
+                repository(url: getReleaseRepositoryUrl()) {
+                    authentication(userName: getRepositoryUsername(), password: getRepositoryPassword())
+                }
+                snapshotRepository(url: getSnapshotRepositoryUrl()) {
+                    authentication(userName: getRepositoryUsername(), password: getRepositoryPassword())
+                }
+
+                pom.project {
+                    name POM_NAME
+                    packaging POM_PACKAGING
+                    description POM_DESCRIPTION
+                    url POM_URL
+
+                    scm {
+                        url POM_SCM_URL
+                        connection POM_SCM_CONNECTION
+                        developerConnection POM_SCM_DEV_CONNECTION
+                    }
+
+                    licenses {
+                        license {
+                            name POM_LICENSE_NAME
+                            url POM_LICENSE_URL
+                            distribution POM_LICENSE_DIST
+                        }
+                    }
+
+                    developers {
+                        developer {
+                            id POM_DEVELOPER_ID
+                            name POM_DEVELOPER_NAME
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    signing {
+        required { isReleaseBuild() && gradle.taskGraph.hasTask("uploadArchives") }
+        sign configurations.archives
+    }
+
+    if (isAndroidArtifact()) {
+        task install(type: Upload, dependsOn: assemble) {
+            description "Installs the Android artifacts to the local Maven repository."
+
+            repositories.mavenInstaller {
+                configuration = configurations.archives
+
+                pom.groupId = GROUP
+                pom.artifactId = POM_ARTIFACT_ID
+                pom.version = version
+
+                pom.project {
+                    name POM_NAME
+                    packaging POM_PACKAGING
+                    description POM_DESCRIPTION
+                    url POM_URL
+
+                    scm {
+                        url POM_SCM_URL
+                        connection POM_SCM_CONNECTION
+                        developerConnection POM_SCM_DEV_CONNECTION
+                    }
+
+                    licenses {
+                        license {
+                            name POM_LICENSE_NAME
+                            url POM_LICENSE_URL
+                            distribution POM_LICENSE_DIST
+                        }
+                    }
+
+                    developers {
+                        developer {
+                            id POM_DEVELOPER_ID
+                            name POM_DEVELOPER_NAME
+                        }
+                    }
+                }
+            }
+        }
+
+        task androidJavadocs(type: Javadoc) {
+            source = android.sourceSets.main.java.source
+            classpath += project.files(android.getBootClasspath().join(File.pathSeparator))
+            exclude getJavadocExcludes()
+        }
+
+        task androidJavadocsJar(type: Jar, dependsOn: androidJavadocs) {
+            classifier = 'javadoc'
+            from androidJavadocs.destinationDir
+        }
+
+        task androidSourcesJar(type: Jar) {
+            classifier = 'sources'
+            from android.sourceSets.main.java.source
+        }
+    } else {
+        install {
+            description "Installs the artifacts to the local Maven repository."
+            repositories.mavenInstaller {
+                pom.groupId = GROUP
+                pom.artifactId = POM_ARTIFACT_ID
+                pom.version = version
+
+                pom.project {
+                    name POM_NAME
+                    packaging POM_PACKAGING
+                    description POM_DESCRIPTION
+                    url POM_URL
+
+                    scm {
+                        url POM_SCM_URL
+                        connection POM_SCM_CONNECTION
+                        developerConnection POM_SCM_DEV_CONNECTION
+                    }
+
+                    licenses {
+                        license {
+                            name POM_LICENSE_NAME
+                            url POM_LICENSE_URL
+                            distribution POM_LICENSE_DIST
+                        }
+                    }
+
+                    developers {
+                        developer {
+                            id POM_DEVELOPER_ID
+                            name POM_DEVELOPER_NAME
+                        }
+                    }
+                }
+            }
+        }
+
+        task sourcesJar(type: Jar, dependsOn: classes) {
+            classifier = 'sources'
+            from sourceSets.main.allSource
+        }
+
+        task javadocJar(type: Jar, dependsOn: javadoc) {
+            classifier = 'javadoc'
+            from javadoc.destinationDir
+            exclude getJavadocExcludes()
+        }
+    }
+
+    if (JavaVersion.current().isJava8Compatible()) {
+        allprojects {
+            tasks.withType(Javadoc) {
+                options.addStringOption('Xdoclint:none', '-quiet')
+            }
+        }
+    }
+
+    artifacts {
+        if (isAndroidArtifact()) {
+            if (!excludeSources()) {
+                archives androidSourcesJar
+            }
+            archives androidJavadocsJar
+        } else {
+            if (!excludeSources()) {
+                archives sourcesJar
+            }
+            archives javadocJar
+        }
+    }
+
+    /** BINTRAY PUBLISHING */
+    // If your module directory matches the desired artifactId, you do not need to set archivesBaseName.
+    archivesBaseName = POM_ARTIFACT_ID
+    bintray {
+        user = getBintrayUsername()
+        key = getBintrayKey()
+
+        configurations = ['archives']
+
+        dryRun = false
+        publish = true
+        override = true
+
+        pkg {
+            repo = BINTRAY_REPO_NAME
+            name = POM_ARTIFACT_ID
+            userOrg = findProperty('BINTRAY_USER_ORG')
+            licenses = getBintrayLicenses()
+            vcsUrl = findProperty('POM_SCM_URL')
+            websiteUrl = findProperty('POM_URL')
+            publicDownloadNumbers = true
+            version {
+                name = project.version
+
+                gpg {
+                    sign = true
+                }
+            }
+        }
+    }
+}
